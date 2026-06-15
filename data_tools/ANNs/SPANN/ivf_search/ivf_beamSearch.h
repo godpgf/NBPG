@@ -60,7 +60,7 @@ namespace ant
                     const std::vector<indexType> &c2v_ids,
                     QueryStatic &QueryStats,
                     std::function<void(BeamSearchMemoryCell<indexType> &, std::vector<IdDist<indexType>> &, std::vector<indexType> &, size_t, size_t)> fill_ngh_dist,
-                    std::function<std::pair<indexType *, uint>(indexType)> get_sp,
+                    std::function<std::pair<indexType *, uint32_t>(indexType)> get_sp,
                     const QueryParams &QP, bool use_rerank, bool contain_centroids = true)
     {
         if (QP.k > QP.beamSize)
@@ -96,24 +96,21 @@ namespace ant
             QueryStats.increment_visited(i, bsCell.num_visited);
             QueryStats.increment_dist(i, dist_cmps);
 
-            size_t num_check = 0;
-            size_t frontier_size = bsCell.frontier_size;
-            num_check = std::min((size_t)QP.k * QP.ivf_rerank_factor, bsCell.frontier_size);
+            const size_t frontier_size = bsCell.frontier_size;
+            const size_t num_check = std::min(static_cast<size_t>(QP.k) * QP.ivf_rerank_factor, frontier_size);
 
             bsCell.clear();
 
             std::vector<IdDist<indexType>> ngh_dist;
             ngh_dist.reserve(QP.beamSize * 4);
-            ngh_dist.resize(0);
             std::vector<indexType> ngh(std::min(num_check, frontier_size));
-            float dist = 0;
-            for (int j = 0; j < std::min(num_check, frontier_size); ++j)
+            for (size_t j = 0; j < std::min(num_check, frontier_size); ++j)
             {
                 ngh[j] = bsCell.frontier[j].index;
                 if (contain_centroids)
                 {
-                    auto index = c2v_ids[bsCell.frontier[j].index];
-                    dist = bsCell.frontier[j].dist;
+                    const auto index = c2v_ids[bsCell.frontier[j].index];
+                    const float dist = bsCell.frontier[j].dist;
                     ngh_dist.push_back(IdDist<indexType>(index, dist));
                     bsCell.has_been_seen(index);
                 }
@@ -154,7 +151,7 @@ namespace ant
                    QCR &Q_Centroids,
                    const std::vector<indexType> &c2v_ids,
                    QueryStatic &QueryStats,
-                   std::function<std::pair<indexType *, uint>(indexType)> get_sp,
+                   std::function<std::pair<indexType *, uint32_t>(indexType)> get_sp,
                    const QueryParams &QP, bool contain_centroid = true)
     {
         auto deg = 16 * 1024 / Q_Base_Points.params.num_bytes();
@@ -178,9 +175,9 @@ namespace ant
             auto *cur_neighbors_ptr = cur_neighbors.data() + worker_id * deg;
             uint32_t cur_neighbors_size = 0;
 
-            auto refresh_neighbors = [&](bool forse)
+            auto refresh_neighbors = [&](bool force)
             {
-                if (cur_neighbors_size >= deg || forse)
+                if (cur_neighbors_size >= deg || force)
                 {
 
                     for (auto j = 0; j < cur_neighbors_size; ++j)
@@ -219,8 +216,7 @@ namespace ant
                 }
             };
 
-            size_t all_size = 0;
-            for (auto cid : ngh)
+            for (const auto cid : ngh)
             {
                 for (auto bin_id = 0; bin_id < bin_size; ++bin_id)
                 {
@@ -256,7 +252,7 @@ namespace ant
                    QCR &Q_Centroids,
                    const std::vector<indexType> &c2v_ids,
                    QueryStatic &QueryStats,
-                   std::function<std::pair<indexType *, uint>(indexType)> get_sp,
+                   std::function<std::pair<indexType *, uint32_t>(indexType)> get_sp,
                    const QueryParams &QP)
     {
         auto less = [&](IdDist<indexType> a, IdDist<indexType> b)
@@ -273,9 +269,9 @@ namespace ant
             std::vector<indexType> cur_neighbors;
             cur_neighbors.reserve(deg);
 
-            auto refresh_neighbors = [&](bool forse)
+            auto refresh_neighbors = [&](bool force)
             {
-                if (cur_neighbors.size() >= deg || forse)
+                if (cur_neighbors.size() >= deg || force)
                 {
 
                     for (auto index : cur_neighbors)
@@ -304,11 +300,9 @@ namespace ant
                 }
             };
 
-            size_t all_size = 0;
-            for (auto cid : ngh)
+            for (const auto cid : ngh)
             {
                 auto [ivf_data, ivf_size] = ivfReader[cid];
-                all_size += ivf_size;
                 for (uint ii = 0; ii < ivf_size; ++ii)
                 {
                     auto index = ivf_data[ii];
@@ -337,7 +331,7 @@ namespace ant
                    QCR &Q_Centroids,
                    const std::vector<indexType> &c2v_ids,
                    QueryStatic &QueryStats,
-                   std::function<std::pair<indexType *, uint>(indexType)> get_sp,
+                   std::function<std::pair<indexType *, uint32_t>(indexType)> get_sp,
                    const QueryParams &QP)
     {
         using dataType = typename QCR::T;
@@ -357,9 +351,9 @@ namespace ant
             std::vector<std::pair<indexType, dataType *>> cur_neighbors;
             cur_neighbors.reserve(deg);
 
-            auto refresh_neighbors = [&](bool forse)
+            auto refresh_neighbors = [&](bool force)
             {
-                if (cur_neighbors.size() >= deg || forse)
+                if (cur_neighbors.size() >= deg || force)
                 {
 
                     for (auto nb : cur_neighbors)
@@ -395,12 +389,10 @@ namespace ant
                 cache.push_back(ivfPosReader.load_ivf_and_pos(cid));
             size_t dims = ivfPosReader.dims;
 
-            size_t all_size = 0;
             for (size_t j = 0; j < cache.size(); ++j)
             {
                 auto [ivf_data, ivf_Pos] = cache[j];
                 size_t ivf_size = ((indexType *)ivf_Pos) - ivf_data;
-                all_size += ivf_size;
                 for (uint ii = 0; ii < ivf_size; ++ii)
                 {
                     auto index = ivf_data[ii];
