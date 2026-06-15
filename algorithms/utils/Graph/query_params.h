@@ -1,55 +1,55 @@
 #pragma once
 #include <algorithm>
-#include <utility> // 包含 std::pair 的头文件
+#include <utility>
 #include "utils/utilities.h"
 
 namespace ant
 {
 
-    // 搜索参数
+    // -------------------------------------------------------------------------
+    // QueryParams — beam search 查询参数
+    // -------------------------------------------------------------------------
     struct QueryParams
     {
-        // k > 0 表示使用第topk个候选邻居到查询向量的距离，
-        // 经过cut缩放后，作为阈值去剪枝其他候选邻居
-        uint32_t k;
-        double cut;
+        // k > 0 时：以 frontier 中第 k 近候选的距离 × cut 作为剪枝阈值（仅查询阶段使用）
+        uint32_t k = 0;
+        double cut = 0.0;
 
-        // 候选邻居大小
-        uint32_t beamSize;
+        // beam 宽度：frontier 最多保留的候选数
+        uint32_t beamSize = 0;
 
-        // 限制总的跳转次数，可以设置为数据集的长度
-        size_t limit;
+        // 最多从 frontier 中 pop 并扩展的节点数（通常设为 |V|）
+        size_t limit = 0;
 
-        // 限制邻居数量
-        uint32_t degree_limit;
+        // 每个图节点最多扩展的邻居数
+        uint32_t degree_limit = 0;
 
-        // 利用压缩向量计算距离，然后对最近的s个结果加载真实向量并重新排序，s=k*rerank_factor
+        // rerank 模式：先用量化向量搜索，再对 frontier 前 k×rerank_factor 个结果
+        // 用原始向量重算距离并重排。rerank_factor == 0 且存在独立原始向量时启用 filtering 模式。
         uint32_t rerank_factor = 40;
 
-        // 用于对ivf进行重排序
+        // IVF 搜索中对质心 beam 结果做 rerank 时的扩展因子
         uint32_t ivf_rerank_factor = 15;
 
+        QueryParams(uint32_t k, uint32_t Q, double cut, size_t limit, uint32_t dg,
+                    uint32_t rerank_factor = 100, uint32_t ivf_rerank_factor = 40)
+            : k(k), beamSize(Q), cut(cut), limit(limit), degree_limit(dg),
+              rerank_factor(rerank_factor), ivf_rerank_factor(ivf_rerank_factor)
+        {
+        }
 
-        QueryParams(uint32_t k, uint32_t Q, double cut, size_t limit, uint32_t dg, uint32_t rerank_factor = 100, uint32_t ivf_rerank_factor = 40) : k(k), beamSize(Q), cut(cut), limit(limit), degree_limit(dg), rerank_factor(rerank_factor), ivf_rerank_factor(ivf_rerank_factor) {}
-
-        QueryParams() {}
+        QueryParams() = default;
     };
 
-    // 搜索统计
+    // -------------------------------------------------------------------------
+    // QueryStatic — 查询统计（每 query 的访问数 / 距离计算次数）
+    // -------------------------------------------------------------------------
     struct QueryStatic
     {
-        QueryStatic(size_t n) : visited(n, 0), distances(n, 0)
-        {
-        }
+        QueryStatic(size_t n) : visited(n, 0), distances(n, 0) {}
 
-        void increment_dist(size_t i, uint32_t j)
-        {
-            distances[i] += j;
-        }
-        void increment_visited(size_t i, uint32_t j)
-        {
-            visited[i] += j;
-        }
+        void increment_dist(size_t i, uint32_t j) { distances[i] += j; }
+        void increment_visited(size_t i, uint32_t j) { visited[i] += j; }
 
         std::pair<uint32_t, uint32_t> visited_stats() { return statistics(visited); }
         uint32_t visited_std() { return (uint32_t)std(visited); }
@@ -68,13 +68,10 @@ namespace ant
             std::sort(s.begin(), s.end());
             double sum = 0;
             for (auto si : s)
-            {
                 sum += si;
-            }
             uint32_t avg = sum / s.size();
             size_t tail_index = .99 * ((float)s.size());
             uint32_t tail = s[tail_index];
-            // 返回均值和99分位的极大值
             return std::pair<uint32_t, uint32_t>(avg, tail);
         }
 
@@ -96,8 +93,10 @@ namespace ant
         std::vector<uint32_t> distances;
     };
 
+    // (index, distance) 对，按 dist 升序、index 升序打破平局
     template <typename indexType>
-    struct IdDist {
+    struct IdDist
+    {
         IdDist(indexType index, float dist) : index(index), dist(dist) {}
         IdDist() = default;
         indexType index;
@@ -105,33 +104,44 @@ namespace ant
     };
 
     template <typename indexType>
-    struct QueryNode : public IdDist<indexType> {
-        QueryNode(indexType index, float dist, uint32_t depth = 0, bool isLeaf = false)
-            : IdDist<indexType>(index, dist), depth(depth), isLeaf(isLeaf) {}
+    struct QueryNode : public IdDist<indexType>
+    {
+        QueryNode(indexType index, float dist, float log_popular = 0)
+            : IdDist<indexType>(index, dist), log_popular(log_popular) {}
         QueryNode() = default;
-        uint32_t depth = 0;
-        bool isLeaf = false;
+        float log_popular = 0;
     };
 
     template <typename indexType>
-    bool id_dist_less(const IdDist<indexType>& a, const IdDist<indexType>& b){
+    bool id_dist_less(const IdDist<indexType> &a, const IdDist<indexType> &b)
+    {
         return a.dist < b.dist || (a.dist == b.dist && a.index < b.index);
     }
 
-    // 缓存搜索过程中的各种数据
+    // -------------------------------------------------------------------------
+    // BeamSearchMemoryCell — 单次 beam search 的工作区（栈上指针，内存由 Table 预分配）
+    //
+    // frontier        : 当前最优 beam，按距离升序，大小 ≤ beamSize
+    // unvisited_frontier : frontier 中尚未 pop 扩展的节点（延迟更新，避免每步全量重排）
+    // visited         : 已 pop 并扩展过的节点
+    // tmp_visited     : filtering 模式下 visited 对应节点的原始向量精确距离
+    // candidates      : 本轮新发现、待并入 frontier 的邻居
+    // hash_filter     : 已见节点哈希过滤（允许假阴性）
+    // -------------------------------------------------------------------------
     template <typename indexType>
     struct BeamSearchMemoryCell
     {
         using QNode = QueryNode<indexType>;
-        BeamSearchMemoryCell() {}
+
+        BeamSearchMemoryCell() = default;
 
         BeamSearchMemoryCell(const BeamSearchMemoryCell<indexType> &bsCell)
         {
-            this->beamSize = bsCell.beamSize;
-            this->visited = bsCell.visited;
-            this->frontier = bsCell.frontier;
-            this->visited_size = bsCell.visited_size;
-            this->frontier_size = bsCell.frontier_size;
+            beamSize = bsCell.beamSize;
+            visited = bsCell.visited;
+            frontier = bsCell.frontier;
+            visited_size = bsCell.visited_size;
+            frontier_size = bsCell.frontier_size;
         }
 
         BeamSearchMemoryCell(uint32_t beamSize,
@@ -144,30 +154,32 @@ namespace ant
                              QNode *visited,
                              QNode *copy_visited,
                              float *tmp_visited,
-                             const size_t max_visited_size) : beamSize(beamSize),
-                                                              frontier(frontier),
-                                                              new_frontier(new_frontier),
-                                                              unvisited_frontier(unvisited_frontier),
-                                                              hash_filter(hash_filter),
-                                                              filtered(filtered),
-                                                              candidates(candidates),
-                                                              visited(visited),
-                                                              copy_visited(copy_visited),
-                                                              tmp_visited(tmp_visited),
-                                                              max_visited_size(max_visited_size)
+                             const size_t max_visited_size)
+            : beamSize(beamSize),
+              frontier(frontier),
+              new_frontier(new_frontier),
+              unvisited_frontier(unvisited_frontier),
+              hash_filter(hash_filter),
+              filtered(filtered),
+              candidates(candidates),
+              visited(visited),
+              copy_visited(copy_visited),
+              tmp_visited(tmp_visited),
+              max_visited_size(max_visited_size)
         {
             clear();
         }
 
         void clear()
         {
-            this->hash_filter_size = get_max_hash_filter_size(beamSize);
-            this->frontier_size = 0;
-            this->visited_size = 0;
-            this->num_visited = 0;
+            hash_filter_size = get_max_hash_filter_size(beamSize);
+            frontier_size = 0;
+            visited_size = 0;
+            num_visited = 0;
             std::fill_n(hash_filter, hash_filter_size, -1);
         }
 
+        // 起点距离已由调用方算好（常用于量化 query × 量化 base）
         void init_starting_points(QNode *starting_points, uint32_t sp_num)
         {
             if (beamSize < sp_num)
@@ -176,25 +188,18 @@ namespace ant
                 abort();
             }
 
-            // 插入frontier
             for (auto sid = 0; sid < sp_num; ++sid)
             {
                 auto q = starting_points[sid];
                 frontier[sid] = q;
-                has_been_seen(q.first);
+                has_been_seen(q.index);
             }
             frontier_size = sp_num;
-
-            auto less = [&](const QNode& a, const QNode& b)
-            {
-                return query_node_less(a, b);
-            };
-            std::sort(frontier, frontier + sp_num, less);
-
-            // 更新unvisited_frontier
+            std::sort(frontier, frontier + sp_num, id_dist_less<indexType>);
             memcpy(unvisited_frontier, frontier, frontier_size * sizeof(QNode));
         }
 
+        // 用 PointRange 对 starting_points 逐点算距并初始化 frontier
         template <typename Point, typename PointRange, typename spType>
         void init_starting_points(const Point p, PointRange &Points, spType *starting_points, uint32_t sp_num)
         {
@@ -204,22 +209,14 @@ namespace ant
                 abort();
             }
 
-            // 插入frontier
             for (auto sid = 0; sid < sp_num; ++sid)
             {
                 auto q = starting_points[sid];
-                frontier[sid] = std::move(QueryNode(static_cast<indexType>(q), Points[q].distance(p)));
+                frontier[sid] = QNode(static_cast<indexType>(q), Points[q].distance(p));
                 has_been_seen(q);
             }
             frontier_size = sp_num;
-
-            auto less = [&](const QNode& a, const QNode& b)
-            {
-                return id_dist_less(a, b);
-            };
-            std::sort(frontier, frontier + frontier_size, less);
-
-            // 更新unvisited_frontier
+            std::sort(frontier, frontier + frontier_size, id_dist_less<indexType>);
             memcpy(unvisited_frontier, frontier, frontier_size * sizeof(QNode));
         }
 
@@ -234,21 +231,13 @@ namespace ant
 
         uint32_t beamSize;
 
-        // Frontier maintains the closest points found so far and its size
-        // is always at most beamSize.  Each entry is a (id,distance) pair.
-        // Initialized with starting points and kept sorted by distance.
         QNode *frontier;
         size_t frontier_size;
 
-        // used as temporaries in the loop
-        // new_frontier.size() == 2 * beamSize + G.max_degree()
         QNode *new_frontier;
 
-        // 记录frontier中没有访问过的元素，最大长度是beamSize
         QNode *unvisited_frontier;
 
-        // used as a hash filter (can give false negative -- i.e. can say
-        // not in table when it is)
         indexType *hash_filter;
         size_t hash_filter_size;
         static size_t get_max_hash_filter_size(uint32_t beamSize)
@@ -257,24 +246,20 @@ namespace ant
             return (1 << bits);
         }
 
-        // 当前遍历到的，准备插入candidates的元素
         indexType *filtered;
 
-        // 当前遍历到的，准备插入frontier的元素
         QNode *candidates;
 
-        // 记录以及访问过的元素
         QNode *visited;
-        QNode *copy_visited; // 用于剪枝
-        // 零时内存，用于存储访问过的元素的量化距离和真实距离
+        QNode *copy_visited;
         float *tmp_visited;
         size_t visited_size;
         size_t num_visited;
-        // 【潜规则】：剪枝时会利用这部分空间，添加已有邻居都访问列表。所以，需要多预留max_degree个位置
+        // 剪枝时会复用 copy_visited，需预留 max_degree 个额外槽位
         size_t max_visited_size;
     };
 
-    // 预先一次性申请多个beamSearch算法需要的所有空间，避免动态申请空间产生的内存碎片
+    // 预分配多 query × 多线程的 beam search 缓冲区，避免热路径上动态分配
     template <typename indexType>
     struct BeamSearchMemoryTable
     {
@@ -284,21 +269,21 @@ namespace ant
                               uint32_t num_workers,
                               uint32_t maxBeamSize,
                               size_t max_visited_size,
-                              uint32_t max_degree) : num_cells(num_cells),
-                                                     num_workers(num_workers),
-                                                     maxBeamSize(maxBeamSize),
-                                                     max_visited_size(max_visited_size),
-                                                     max_degree(max_degree),
-                                                     all_frontier(num_cells * get_max_frontier_size(maxBeamSize)),
-                                                     all_new_frontier(num_workers * get_max_new_frontier_size(maxBeamSize, max_degree)),
-                                                     all_unvisited_frontier(num_workers * get_max_frontier_size(maxBeamSize)),
-                                                     all_hash_filter(num_workers * BeamSearchMemoryCell<indexType>::get_max_hash_filter_size(maxBeamSize)),
-                                                     all_filtered(num_workers * get_max_filtered_size(max_degree)),
-                                                     all_candidates(num_workers * get_max_candidate_size(maxBeamSize, max_degree)),
-                                                     all_visited(num_cells * max_visited_size),
-                                                     all_copy_visited(num_cells * max_visited_size),
-                                                     all_tmp_visited(num_cells * max_visited_size)
-
+                              uint32_t max_degree)
+            : num_cells(num_cells),
+              num_workers(num_workers),
+              maxBeamSize(maxBeamSize),
+              max_visited_size(max_visited_size),
+              max_degree(max_degree),
+              all_frontier(num_cells * get_max_frontier_size(maxBeamSize)),
+              all_new_frontier(num_workers * get_max_new_frontier_size(maxBeamSize, max_degree)),
+              all_unvisited_frontier(num_workers * get_max_frontier_size(maxBeamSize)),
+              all_hash_filter(num_workers * BeamSearchMemoryCell<indexType>::get_max_hash_filter_size(maxBeamSize)),
+              all_filtered(num_workers * get_max_filtered_size(max_degree)),
+              all_candidates(num_workers * get_max_candidate_size(maxBeamSize, max_degree)),
+              all_visited(num_cells * max_visited_size),
+              all_copy_visited(num_cells * max_visited_size),
+              all_tmp_visited(num_cells * max_visited_size)
         {
         }
 
@@ -337,6 +322,7 @@ namespace ant
 
         size_t get_max_visited_size() { return max_visited_size; }
         const uint32_t max_degree;
+
     protected:
         std::vector<QNode> all_frontier;
         std::vector<QNode> all_new_frontier;
@@ -351,10 +337,11 @@ namespace ant
         uint32_t num_workers;
         uint32_t maxBeamSize;
         size_t max_visited_size;
-        
+
         static size_t get_max_frontier_size(uint32_t beamSize) { return beamSize; }
         static size_t get_max_new_frontier_size(uint32_t beamSize, uint32_t max_degree) { return 2 * beamSize + max_degree; }
         static uint32_t get_max_filtered_size(uint32_t max_degree) { return max_degree; }
+        // 延迟合并：最多累积约 beamSize/8 批邻居后再排序，上界取 beamSize + max_degree
         static uint32_t get_max_candidate_size(uint32_t beamSize, uint32_t max_degree) { return beamSize + max_degree; }
     };
 }

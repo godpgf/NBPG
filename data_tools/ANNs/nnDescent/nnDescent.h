@@ -1,7 +1,12 @@
 #pragma once
+
+#include <algorithm>
+#include <iostream>
+#include <numeric>
+#include <unordered_set>
 #include <vector>
+
 #include "utils/utilities.h"
-#include "utils/stats/get_time.h"
 #include "utils/Graph/query_params.h"
 
 namespace ant
@@ -13,253 +18,226 @@ namespace ant
         using pid = IdDist<indexType>;
         using edge = std::pair<indexType, indexType>;
         using labelled_edge = std::pair<indexType, pid>;
+        using inv_neighbor_list = std::pair<indexType, std::vector<indexType>>;
 
         double delta;
         uint32_t L;
         int max_rounds = 64;
 
-        NNDescent(uint32_t L, double delta, int max_rounds) : L(L), delta(delta), max_rounds(max_rounds)
+        NNDescent(uint32_t L, double delta, int max_rounds)
+            : L(L), delta(delta), max_rounds(max_rounds)
         {
         }
 
         template <typename GraphI, typename Prune>
-        void undirect_and_prune(GraphI &G, Prune &prune, PointRange &Points, double alpha, double cos_angle, std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
+        void undirect_and_prune(GraphI &G, Prune &prune, PointRange &Points, double alpha, double cos_angle,
+                                std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
         {
-            std::vector<std::vector<labelled_edge>> to_group(old_neighbors.size());
-
-            auto less2 = [](pid a, pid b)
-            {
-                return id_dist_less(a, b);
-            };
+            const size_t num_vertices = old_neighbors.size();
+            std::vector<std::vector<labelled_edge>> directed_edges(num_vertices);
 
 #pragma omp parallel for
-            for (indexType i = 0; i < old_neighbors.size(); ++i)
+            for (indexType i = 0; i < num_vertices; ++i)
             {
-                size_t s = old_neighbors[i].size();
-                std::vector<labelled_edge> e(s);
-                for (indexType j = 0; j < s; j++)
+                const size_t neighbor_count = old_neighbors[i].size();
+                std::vector<labelled_edge> edges(neighbor_count);
+                for (size_t j = 0; j < neighbor_count; ++j)
                 {
-                    e[j] = std::make_pair(old_neighbors[i][j].index, pid(i, old_neighbors[i][j].dist));
+                    edges[j] = {old_neighbors[i][j].index, pid(i, old_neighbors[i][j].dist)};
                 }
-                to_group[i] = e;
+                directed_edges[i] = std::move(edges);
             }
 
             std::vector<labelled_edge> flat_edges;
-            flat(to_group, flat_edges);
+            flat(directed_edges, flat_edges);
 
             std::vector<std::pair<indexType, std::vector<pid>>> undirected_graph;
             groupby(flat_edges, undirected_graph);
 
-            size_t offset = undirected_graph.size() * delta;
-            for (size_t m = 0; m < undirected_graph.size(); m += offset)
+            const size_t merge_chunk = std::max<size_t>(1, static_cast<size_t>(undirected_graph.size() * delta));
+            for (size_t chunk_begin = 0; chunk_begin < undirected_graph.size(); chunk_begin += merge_chunk)
             {
-                size_t mm = undirected_graph.size() < (m + offset) ? undirected_graph.size() : (m + offset);
+                const size_t chunk_end = std::min(chunk_begin + merge_chunk, undirected_graph.size());
 
 #pragma omp parallel for
-                for (size_t i = m; i < mm; ++i)
+                for (size_t i = chunk_begin; i < chunk_end; ++i)
                 {
-                    indexType index = undirected_graph[i].first;
-                    std::vector<pid> &ngh = undirected_graph[i].second;
-                    std::vector<pid> new_edges;
-                    auto &old_ngh = old_neighbors[index];
-                    std::merge(
-                        old_ngh.begin(), old_ngh.end(), // 第一个有序范围
-                        ngh.begin(), ngh.end(),         // 第二个有序范围
-                        std::back_inserter(new_edges),  // 插入迭代器
-                        less2);
-                    new_edges.erase(std::unique(new_edges.begin(), new_edges.end(), [](auto a, auto b)
-                                                { return a.index == b.index; }),
-                                    new_edges.end());
-
-                    old_neighbors[index] = new_edges;
+                    const indexType vertex = undirected_graph[i].first;
+                    auto &merged = old_neighbors[vertex];
+                    merge_and_dedupe(merged, undirected_graph[i].second);
                 }
             }
-            std::cout << std::endl;
 
-// fill new graph ready to beam search
 #pragma omp parallel for
-            for (size_t index = 0; index < old_neighbors.size(); ++index)
+            for (size_t index = 0; index < num_vertices; ++index)
             {
-                size_t candidates_size = old_neighbors[index].size();
-                if(alpha > 1e-5 || cos_angle > 1e-5){
-                    size_t cal_num = prune.robustPrune((indexType)-1, old_neighbors[index].data(), candidates_size, Points, alpha, cos_angle);
-                    BuildStats.increment_dist(index, cal_num);
-                } 
+                size_t candidate_count = old_neighbors[index].size();
+                if (alpha > 1e-5 || cos_angle > 1e-5)
+                {
+                    const size_t dist_calls = prune.robustPrune(static_cast<indexType>(-1),
+                                                                old_neighbors[index].data(),
+                                                                candidate_count, Points, alpha, cos_angle);
+                    BuildStats.increment_dist(index, dist_calls);
+                }
 
-                if (candidates_size > G.max_degree())
-                    candidates_size = G.max_degree();
-                G[index].update_neighbors(old_neighbors[index].data(), candidates_size);
+                if (candidate_count > G.max_degree())
+                    candidate_count = G.max_degree();
+                G[index].update_neighbors(old_neighbors[index].data(), candidate_count);
             }
         }
 
-        static void reverse_graph(std::vector<std::vector<pid>> &old_neighbors, std::vector<std::pair<indexType, std::vector<indexType>>> &inv_neighbors)
+        static void reverse_graph(const std::vector<std::vector<pid>> &old_neighbors,
+                                  std::vector<inv_neighbor_list> &inv_neighbors)
         {
-
-            std::vector<std::vector<edge>> to_group(old_neighbors.size());
+            const size_t num_vertices = old_neighbors.size();
+            std::vector<std::vector<edge>> directed_edges(num_vertices);
 
 #pragma omp parallel for
-            for (indexType i = 0; i < old_neighbors.size(); ++i)
+            for (indexType i = 0; i < num_vertices; ++i)
             {
-                size_t s = old_neighbors[i].size();
-                std::vector<edge> e(s);
-                for (indexType j = 0; j < s; j++)
+                const size_t neighbor_count = old_neighbors[i].size();
+                std::vector<edge> edges(neighbor_count);
+                for (size_t j = 0; j < neighbor_count; ++j)
                 {
-                    e[j] = std::make_pair(old_neighbors[i][j].index, i);
+                    edges[j] = {old_neighbors[i][j].index, i};
                 }
-                to_group[i] = e;
+                directed_edges[i] = std::move(edges);
             }
 
             std::vector<edge> flat_edges;
-            flat(to_group, flat_edges);
+            flat(directed_edges, flat_edges);
             groupby(flat_edges, inv_neighbors);
 
 #pragma omp parallel for
             for (indexType i = 0; i < inv_neighbors.size(); ++i)
             {
-                auto &edges = inv_neighbors[i].second;
-                std::sort(edges.begin(), edges.end());
-                edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+                auto &sources = inv_neighbors[i].second;
+                std::sort(sources.begin(), sources.end());
+                sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
             }
         }
 
-        void nn_descent_chunk(PointRange &Points, std::vector<int> &changed,
-                              std::vector<int> &new_changed, std::pair<indexType, std::vector<indexType>> *begin,
-                              std::pair<indexType, std::vector<indexType>> *end,
-                              std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
+        void nn_descent_chunk(PointRange &Points, const std::vector<int> &changed,
+                              std::vector<int> &new_changed, inv_neighbor_list *begin,
+                              inv_neighbor_list *end, std::vector<std::vector<pid>> &old_neighbors,
+                              QueryStatic &BuildStats)
         {
-            size_t stride = end - begin;
-            auto less = [](pid a, pid b)
-            { return id_dist_less(a, b); };
-            std::vector<std::vector<labelled_edge>> grouped_labelled(stride);
-            // Timer a("chunk start");
-// 从反向边中，找到正向边所没有的邻居，如果这些邻居满足topR最近邻规则约束，就插入
+            const size_t chunk_size = end - begin;
+            std::vector<std::vector<labelled_edge>> candidate_edges(chunk_size);
+
+            // 利用反向边发现新的候选近邻，并按 NN-Descent 规则插入
 #pragma omp parallel for schedule(auto)
-            for (size_t i = 0; i < stride; ++i)
+            for (size_t i = 0; i < chunk_size; ++i)
             {
-                indexType index = (begin + i)->first;
-                std::set<indexType> to_filter;
-                to_filter.insert(index);
-                for (indexType j = 0; j < old_neighbors[index].size(); j++)
-                {
-                    to_filter.insert(old_neighbors[index][j].index);
-                }
-                auto f = [&](indexType a)
-                { return (to_filter.find(a) == to_filter.end()); };
+                const indexType vertex = (begin + i)->first;
+                const auto &sources = (begin + i)->second;
+                const auto &current_neighbors = old_neighbors[vertex];
+
+                std::unordered_set<indexType> excluded;
+                excluded.reserve(current_neighbors.size() + 1);
+                excluded.insert(vertex);
+                for (const auto &neighbor : current_neighbors)
+                    excluded.insert(neighbor.index);
 
                 std::vector<indexType> filtered_candidates;
-                std::copy_if((begin + i)->second.begin(), (begin + i)->second.end(), std::back_inserter(filtered_candidates), f);
-
-                std::vector<labelled_edge> &edges = grouped_labelled[i];
-                edges.reserve(L * 2);
-                edges.resize(0);
-
-                size_t cmp_cnt = 0;
-                for (indexType l = 0; l < filtered_candidates.size(); l++)
+                filtered_candidates.reserve(sources.size());
+                for (const indexType source : sources)
                 {
-                    indexType j = filtered_candidates[l];
-                    float j_max = old_neighbors[j][old_neighbors[j].size() - 1].dist;
-                    for (indexType m = l + 1; m < filtered_candidates.size(); m++)
+                    if (excluded.find(source) == excluded.end())
+                        filtered_candidates.push_back(source);
+                }
+
+                auto &edges = candidate_edges[i];
+                edges.reserve(L * 2);
+
+                size_t dist_calls = 0;
+                for (size_t l = 0; l < filtered_candidates.size(); ++l)
+                {
+                    const indexType j = filtered_candidates[l];
+                    const float j_max = old_neighbors[j].back().dist;
+                    for (size_t m = l + 1; m < filtered_candidates.size(); ++m)
                     {
-                        indexType k = filtered_candidates[m];
-                        if (changed[j] || changed[k])
-                        {
-                            float dist = Points[j].distance(Points[k]);
-                            cmp_cnt++;
-                            float k_max = old_neighbors[k][old_neighbors[k].size() - 1].dist;
-                            if (dist < j_max)
-                                edges.push_back(std::make_pair(j, pid(k, dist)));
-                            if (dist < k_max)
-                                edges.push_back(std::make_pair(k, pid(j, dist)));
-                        }
+                        const indexType k = filtered_candidates[m];
+                        if (!changed[j] && !changed[k])
+                            continue;
+
+                        const float dist = Points[j].distance(Points[k]);
+                        ++dist_calls;
+                        const float k_max = old_neighbors[k].back().dist;
+                        if (dist < j_max)
+                            edges.emplace_back(j, pid(k, dist));
+                        if (dist < k_max)
+                            edges.emplace_back(k, pid(j, dist));
                     }
                 }
-                BuildStats.increment_dist(index, cmp_cnt);
+                BuildStats.increment_dist(vertex, dist_calls);
             }
-            // a.total();
 
-            // Timer b("chunk groupby");
-            // 对所有新插入的边进行groupby
-            std::vector<labelled_edge> flat_grouped_labelled;
-            flat(grouped_labelled, flat_grouped_labelled);
+            std::vector<labelled_edge> flat_edges;
+            flat(candidate_edges, flat_edges);
 
-            std::vector<std::pair<indexType, std::vector<pid>>> candidates;
-            groupby(flat_grouped_labelled, candidates);
-            // b.total();
+            std::vector<std::pair<indexType, std::vector<pid>>> grouped_candidates;
+            groupby(flat_edges, grouped_candidates);
 
-            // Timer c("chunk end");
-#pragma omp parallel for schedule(auto) // 每个线程每次处理512个迭代
-            for (size_t i = 0; i < candidates.size(); ++i)
+#pragma omp parallel for schedule(auto)
+            for (size_t i = 0; i < grouped_candidates.size(); ++i)
             {
-                auto &ngh = candidates[i].second;
-                std::sort(ngh.begin(), ngh.end(), less);
-                ngh.erase(std::unique(ngh.begin(), ngh.end(), [](auto a, auto b)
-                                      { return a.index == b.index; }),
-                          ngh.end());
+                const indexType vertex = grouped_candidates[i].first;
+                auto &candidates = grouped_candidates[i].second;
+                std::sort(candidates.begin(), candidates.end(), pid_less);
+                dedupe_by_index(candidates);
 
-                std::vector<pid> new_edges;
-                indexType index = candidates[i].first;
-                auto &old_ngh = old_neighbors[index];
-                std::merge(
-                    old_ngh.begin(), old_ngh.end(), // 第一个有序范围
-                    ngh.begin(), ngh.end(),         // 第二个有序范围
-                    std::back_inserter(new_edges),  // 插入迭代器
-                    less);
-                new_edges.erase(std::unique(new_edges.begin(), new_edges.end(), [](auto a, auto b)
-                                            { return a.index == b.index; }),
-                                new_edges.end());
-                if (new_edges.size() > L)
+                auto merged = old_neighbors[vertex];
+                merge_and_dedupe(merged, candidates);
+                if (merged.size() > L)
+                    merged.resize(L);
+
+                const auto &previous = old_neighbors[vertex];
+                if (merged.size() != previous.size() || merged.back().index != previous.back().index)
                 {
-                    new_edges.resize(L);
-                }
-                auto last_id = new_edges.size() - 1;
-                if (new_edges.size() != old_ngh.size() || new_edges[last_id].index != old_ngh[last_id].index)
-                {
-                    old_neighbors[index] = new_edges;
-                    new_changed[index] = 1;
+                    old_neighbors[vertex] = std::move(merged);
+                    new_changed[vertex] = 1;
                 }
             }
-            // c.total();
         }
 
-        size_t nn_descent(PointRange &Points, std::vector<int> &new_changed, std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
+        size_t nn_descent(PointRange &Points, std::vector<int> &new_changed,
+                          std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
         {
             std::vector<int> changed = new_changed;
-            memset(new_changed.data(), 0, new_changed.size() * sizeof(int));
-            std::vector<std::pair<indexType, std::vector<indexType>>> rev;
-            // Timer a("inv");
-            reverse_graph(old_neighbors, rev);
-            // a.total();
+            std::fill(new_changed.begin(), new_changed.end(), 0);
 
-            size_t n = Points.size();
-            std::uniform_int_distribution<indexType> dis(0, n - 1);
-            int batch_size = 100000;
-            auto *begin = rev.data();
-            auto *end = rev.data();
-            int counter = 0;
-            auto *last = rev.data() + rev.size();
-            while (end != last)
+            std::vector<inv_neighbor_list> inv_neighbors;
+            reverse_graph(old_neighbors, inv_neighbors);
+
+            constexpr int batch_size = 100000;
+            inv_neighbor_list *chunk_begin = inv_neighbors.data();
+            const inv_neighbor_list *const inv_end = inv_neighbors.data() + inv_neighbors.size();
+            while (chunk_begin != inv_end)
             {
-                counter++;
-                begin = end;
-                int remaining = last - end;
-                end += std::min(remaining, batch_size);
-                nn_descent_chunk(Points, changed, new_changed, begin, end, old_neighbors, BuildStats);
+                const int remaining = static_cast<int>(inv_end - chunk_begin);
+                inv_neighbor_list *chunk_end = chunk_begin + std::min(remaining, batch_size);
+                nn_descent_chunk(Points, changed, new_changed, chunk_begin, chunk_end, old_neighbors, BuildStats);
+                chunk_begin = chunk_end;
             }
+
             return std::accumulate(new_changed.begin(), new_changed.end(), static_cast<size_t>(0));
         }
 
-        int nn_descent_wrapper(PointRange &Points, std::vector<std::vector<pid>> &old_neighbors, QueryStatic &BuildStats)
+        int nn_descent_wrapper(PointRange &Points, std::vector<std::vector<pid>> &old_neighbors,
+                               QueryStatic &BuildStats)
         {
-            size_t n = Points.size();
-            std::vector<int> changed(n, 1);
+            const size_t num_vertices = Points.size();
+            std::vector<int> changed(num_vertices, 1);
             int rounds = 0;
 
-            size_t change_num = n;
+            size_t change_num = num_vertices;
+            const size_t convergence_threshold = static_cast<size_t>(delta * num_vertices);
 
-            while (change_num >= delta * n && rounds < max_rounds)
+            while (change_num >= convergence_threshold && rounds < max_rounds)
             {
                 change_num = nn_descent(Points, changed, old_neighbors, BuildStats);
-                rounds++;
+                ++rounds;
                 std::cout << change_num << " elements changed" << std::endl;
                 std::cout << "Round " << rounds << " of " << max_rounds << " completed" << std::endl;
             }
@@ -270,5 +248,30 @@ namespace ant
             std::cout << std::endl;
             return rounds;
         }
+
+    private:
+        static bool pid_less(const pid &a, const pid &b)
+        {
+            return id_dist_less<indexType>(a, b);
+        }
+
+        static void dedupe_by_index(std::vector<pid> &neighbors)
+        {
+            neighbors.erase(std::unique(neighbors.begin(), neighbors.end(),
+                                        [](const pid &a, const pid &b)
+                                        { return a.index == b.index; }),
+                            neighbors.end());
+        }
+
+        static void merge_and_dedupe(std::vector<pid> &dst, const std::vector<pid> &src)
+        {
+            std::vector<pid> merged;
+            merged.reserve(dst.size() + src.size());
+            std::merge(dst.begin(), dst.end(), src.begin(), src.end(),
+                       std::back_inserter(merged), pid_less);
+            dedupe_by_index(merged);
+            dst = std::move(merged);
+        }
     };
+
 }

@@ -7,6 +7,7 @@
 #include "utils/stats/get_time.h"
 #include "utils/Graph/graph.h"
 #include "utils/utilities.h"
+#include "utils/Point/point_range.h"
 
 namespace ant
 {
@@ -16,6 +17,15 @@ namespace ant
     public:
         using QNode = QueryNode<indexType>;
         using IDist = IdDist<indexType>;
+
+        struct SearchResult
+        {
+            QNode *prune_res;
+            QNode *vit_res;
+            size_t prune_size;
+            size_t vit_size;
+            indexType index;
+        };
 
         SPANNIndex(uint32_t bin_size) : bin_size(bin_size) {}
 
@@ -29,7 +39,7 @@ namespace ant
 
         void init_v2c_ids(size_t pointSize){
             v2c_ids.resize(pointSize);
-            std::fill_n(v2c_ids.data(), vector_num, -1);
+            std::fill_n(v2c_ids.data(), pointSize, -1);
             for (uint32_t i = 0; i < c2v_ids.size(); ++i)
             {
                 v2c_ids[c2v_ids[i]] = i;
@@ -41,7 +51,7 @@ namespace ant
                         uint32_t top_degree, uint32_t num_split, uint32_t num_passes, 
                         float dir_bias_scale, double min_alpha, double max_alpha, double min_cos_angle, double max_cos_angle,
                         bool dynamic_prune, bool rand_sp, bool repair_isolate, QueryStatic &BuildStats){
-            size_t n = v2c_ids.size();
+            size_t n = c2v_ids.size();
             centroidGraph = Graph<uint32_t>(maxDeg, n);
             RefPointRange<PR, indexType> centroids = RefPointRange<PR, indexType>(c2v_ids.data(), c2v_ids.size(), &Points);
             size_t limit = centroids.size();
@@ -49,7 +59,7 @@ namespace ant
             return build_vamana(centroids, centroidGraph, L, VL,
                         top_degree, num_split, num_passes, limit,
                         dir_bias_scale, min_alpha, max_alpha, min_cos_angle, max_cos_angle,
-                        dynamic_prune, rand_sp, repair_isolate, BuildStats)            
+                        dynamic_prune, rand_sp, repair_isolate, BuildStats);     
         }
 
         template <typename PR>
@@ -67,7 +77,10 @@ namespace ant
                 ivf_index[i].resize(0);
             }
 
-            auto less = [](id_dist a, id_dist b)
+            using QNode = QueryNode<indexType>;
+
+            using CmpFun = std::function<bool(const QNode& a, const QNode& b)>;
+            CmpFun less = [&](const QNode& a, const QNode& b)
             {
                 return id_dist_less(a, b);
             };
@@ -75,7 +88,7 @@ namespace ant
             // 申请beamSearch需要的空间
             auto num_workers = omp_get_max_threads();
             auto bsTable = BeamSearchMemoryTable<indexType>(max_cache_size, num_workers, beamSize, max_visited_size, centroidGraph.max_degree());
-            std::vector<BeamSearchMemoryCell<indexType>> new_out_(max_cache_size);
+            std::vector<SearchResult> new_out_(max_cache_size);
             for (size_t sid = 0; sid < Points.size(); sid += max_cache_size)
             {
                 size_t cur_batch_size = sid + max_cache_size > Points.size() ? Points.size() - sid : max_cache_size;
@@ -101,12 +114,12 @@ namespace ant
                     size_t candidate_id = 0;
                     while (candidate_id < bsCell.visited_size)
                     {
-                        auto cnt = get_ivf_size(ivf_index, bsCell.visited[candidate_id++].first, bin_size);
+                        auto cnt = get_ivf_size(ivf_index, bsCell.visited[candidate_id++].index, bin_size);
                         if (cnt > max_ivf_size)
                             continue;
                         bsCell.visited[new_visited_size] = bsCell.visited[candidate_id - 1];
                         if (congestionAwareAssignment)
-                            bsCell.visited[new_visited_size].second *= (1 + log(cnt + 1));
+                            bsCell.visited[new_visited_size].dist *= (1 + log(cnt + 1));
                         new_visited_size++;
                     }
                     bsCell.visited_size = new_visited_size;
@@ -117,7 +130,10 @@ namespace ant
                     if (bsCell.visited_size > ivf_R)
                         bsCell.visited_size = ivf_R;
 
-                    new_out_[i] = bsCell;
+                    auto &res = new_out_.data()[i];
+                    res.vit_res = bsCell.visited;
+                    res.vit_size = bsCell.visited_size;
+                    res.index = i;
                 }
 
                 for (size_t i = 0; i < cur_batch_size; ++i)
@@ -125,9 +141,10 @@ namespace ant
                     indexType index = sid + i;
                     uint32_t bin_id = index % bin_size;
                     uint32_t iid = index / bin_size;
-                    for (size_t j = 0; j < new_out_[i].visited_size; ++j)
+                    for (size_t j = 0; j < new_out_[i].vit_size; ++j)
                     {
-                        auto [centroid_id, dist] = new_out_[i].visited[j];
+                        auto centroid_id = new_out_[i].vit_res[j].index;
+                        auto dist = new_out_[i].vit_res[j].dist;
                         auto ivf_id = centroid_id * bin_size + bin_id;
                         ivf_index[ivf_id].push_back(iid);
                         
@@ -169,8 +186,8 @@ namespace ant
             if (v2c_ids[index] != -1)
             {
                 // 直接插入对应质心的ivf就行
-                bsCell.visited[0].first = v2c_ids[index];
-                bsCell.visited[0].second = distType(0.0f);
+                bsCell.visited[0].index = v2c_ids[index];
+                bsCell.visited[0].dist = 0.0f;
                 bsCell.visited_size = 1;
             }
             else

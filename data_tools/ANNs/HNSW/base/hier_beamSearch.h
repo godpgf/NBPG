@@ -1,6 +1,7 @@
 #pragma once
 #include "utils/Graph/beamSearch.h"
 #include "hier_idmapping.h"
+#include "hier_utils.h"
 
 namespace ant
 {
@@ -62,34 +63,15 @@ namespace ant
                 }
                 auto bsCell = bsTable.getCell(i, worker_id, QP.beamSize, QP.beamSize * 8);
 
-                uint32_t sp_num = 1;
-                while (sp_num < hier_beamSize)
-                {
-                    if (spPtr[sp_num] != -1)
-                    {
-                        sp_num++;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                const uint32_t sp_num = count_valid_entry_points(spPtr, hier_beamSize);
                 assert(spPtr[0] < G.size());
                 bsCell.init_starting_points(Q_Query_Points[i], Q_HierPoints, spPtr, sp_num);
 
                 if (sp_level > 0)
                 {
                     beam_search(bsCell, G, Q_Query_Points[i], Q_HierPoints, cur_QP);
-                    std::fill_n(spPtr, hier_beamSize, -1);
-                    for (size_t j = 0; j < std::min((size_t)hier_beamSize, bsCell.visited_size); ++j)
-                    {
-                        auto near_id = bsCell.visited[j].index;
-                        auto pre_node_id = hidMapping.get_id_in_pre_level(near_id);
-                        assert(hidMapping.get_level(pre_node_id) == sp_level - 1);
-                        spPtr[j] = pre_node_id;
-                    }
-
-                    // sp = pre_node_id;
+                    fill_next_level_entry_points(
+                        spPtr, hier_beamSize, bsCell.visited, bsCell.visited_size, hidMapping, static_cast<int>(sp_level));
                 }
                 else
                 {

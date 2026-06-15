@@ -6,7 +6,7 @@
 #include <fstream>
 #include <set>
 #include <functional>
-#include "ivf.h"
+#include "utils/ivf/ivf.h"
 #include "utils/mmap.h"
 
 namespace ant

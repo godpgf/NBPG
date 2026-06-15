@@ -19,7 +19,7 @@ struct Args
     std::string query_path;
     std::string gt_path;
     // std::string data_type = "uint8";
-    // std::string dist_func = "euclidian";
+    // std::string dist_func = "euclidean";
     std::string index_type = "uint32";
     bool use_mips = false;
     // uint32_t chunk_size = 1;
@@ -71,7 +71,7 @@ void test(Args args)
     using id_dist = std::pair<indexType, float>;
     int k = args.k;
 
-    auto query_points = loadPointRange<indexType, QyPR>(args.query_path.c_str(), args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDIAN);
+    auto query_points = load_point_range<indexType, QyPR>(args.query_path.c_str(), args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDEAN);
     if (args.q_num > 0)
     {
         query_points.resize(args.q_num);
@@ -93,7 +93,7 @@ void test(Args args)
     reader.read((char *)&dims, sizeof(indexType));
 
     using Parameters = typename PR::Parameters;
-    PR base_points = PR(BLOCK_SIZE, Parameters(dims, args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDIAN));
+    PR base_points = PR(BLOCK_SIZE, Parameters(dims, args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDEAN));
 
     // 计算查询向量与所有当前读出向量的距离
 

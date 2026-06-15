@@ -5,12 +5,11 @@
 namespace ant
 {
     template <typename PR, typename Query, typename indexType>
-    void refresh_ngh_dist(PR &Points, const Query &q, std::vector<std::pair<indexType, float>> &ngh_dist, std::vector<indexType> &ngh, bool unique)
+    void refresh_ngh_dist(PR &Points, const Query &q, std::vector<IdDist<indexType>> &ngh_dist, std::vector<indexType> &ngh, bool unique)
     {
-        using id_dist = std::pair<indexType, float>;
-        auto less = [&](id_dist a, id_dist b)
+        auto less = [&](IdDist<indexType> a, IdDist<indexType> b)
         {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
+            return a.dist < b.dist || (a.dist == b.dist && a.index < b.index);
         };
 
         auto deg = 16 * 1024 / Points.params.num_bytes();
@@ -18,8 +17,8 @@ namespace ant
             deg = 1;
         ngh.resize(ngh_dist.size());
 
-        std::transform(ngh_dist.begin(), ngh_dist.end(), ngh.data(), [](id_dist a)
-                       { return a.first; });
+        std::transform(ngh_dist.begin(), ngh_dist.end(), ngh.data(), [](IdDist<indexType> a)
+                       { return a.index; });
         if (unique)
         {
             // 1. 排序
@@ -45,13 +44,13 @@ namespace ant
             for (auto j = 0; j < cur_deg; ++j)
             {
                 auto toid = sid + j;
-                ngh_dist[toid] = id_dist(ngh[toid], Points[ngh[toid]].distance(q));
+                ngh_dist[toid] = IdDist<indexType>(ngh[toid], Points[ngh[toid]].distance(q));
             }
         }
         std::sort(ngh_dist.begin(), ngh_dist.end(), less);
     }
 
-    template <typename indexType, typename distType, typename QyPR, typename QyQPR, typename PR, typename QCR>
+    template <typename indexType, typename QyPR, typename QyQPR, typename PR, typename QCR>
     std::vector<std::vector<indexType>>
     ivf_qsearchAll_(QyPR &Query_Points,
                     QyQPR &Q_Query_Points,
@@ -60,13 +59,10 @@ namespace ant
                     QCR &Q_Centroids,
                     const std::vector<indexType> &c2v_ids,
                     QueryStatic &QueryStats,
-                    std::function<void(BeamSearchMemoryCell<indexType, distType> &, std::vector<std::pair<indexType, float>> &, std::vector<indexType> &, size_t, size_t)> fill_ngh_dist,
+                    std::function<void(BeamSearchMemoryCell<indexType> &, std::vector<IdDist<indexType>> &, std::vector<indexType> &, size_t, size_t)> fill_ngh_dist,
                     std::function<std::pair<indexType *, uint>(indexType)> get_sp,
                     const QueryParams &QP, bool use_rerank, bool contain_centroids = true)
     {
-
-        using id_dist = std::pair<indexType, distType>;
-        using id_distf = std::pair<indexType, float>;
         if (QP.k > QP.beamSize)
         {
             std::cout << "Error: beam search parameter Q = " << QP.beamSize
@@ -74,18 +70,13 @@ namespace ant
             abort();
         }
 
-        auto less = [&](id_dist a, id_dist b)
-        {
-            return id_dist_less(a, b);
-        };
-
         // 申请beamSearch所需要使用的空间----------------------------
         uint num_workers = omp_get_max_threads();
-        auto bsTable = BeamSearchMemoryTable<indexType, distType>(Query_Points.size(),
-                                                                  num_workers,
-                                                                  QP.beamSize,
-                                                                  QP.beamSize * 8,
-                                                                  G.max_degree());
+        auto bsTable = BeamSearchMemoryTable<indexType>(Query_Points.size(),
+                                                        num_workers,
+                                                        QP.beamSize,
+                                                        QP.beamSize * 8,
+                                                        G.max_degree());
 
         std::vector<std::vector<indexType>> all_neighbors(Query_Points.size());
 #pragma omp parallel for
@@ -96,7 +87,7 @@ namespace ant
             uint worker_id = omp_get_thread_num();
             // 找到候选邻居集合
             auto [starting_points, sp_num] = get_sp(i);
-            BeamSearchMemoryCell<indexType, distType> bsCell = bsTable.getCell(i, worker_id, QP.beamSize, QP.beamSize * 8);
+            BeamSearchMemoryCell<indexType> bsCell = bsTable.getCell(i, worker_id, QP.beamSize, QP.beamSize * 8);
             bsCell.init_starting_points(Q_Query_Points[i], Q_Centroids, starting_points, sp_num);
 
             // 获得查询到的质心
@@ -111,19 +102,19 @@ namespace ant
 
             bsCell.clear();
 
-            std::vector<id_distf> ngh_dist;
+            std::vector<IdDist<indexType>> ngh_dist;
             ngh_dist.reserve(QP.beamSize * 4);
             ngh_dist.resize(0);
             std::vector<indexType> ngh(std::min(num_check, frontier_size));
             float dist = 0;
             for (int j = 0; j < std::min(num_check, frontier_size); ++j)
             {
-                ngh[j] = bsCell.frontier[j].first;
+                ngh[j] = bsCell.frontier[j].index;
                 if (contain_centroids)
                 {
-                    auto index = c2v_ids[bsCell.frontier[j].first];
-                    dist = make_dist(bsCell.frontier[j]);
-                    ngh_dist.push_back(id_distf(index, dist));
+                    auto index = c2v_ids[bsCell.frontier[j].index];
+                    dist = bsCell.frontier[j].dist;
+                    ngh_dist.push_back(IdDist<indexType>(index, dist));
                     bsCell.has_been_seen(index);
                 }
             }
@@ -143,8 +134,8 @@ namespace ant
             }
 
             ngh.resize(ngh_dist.size());
-            std::transform(ngh_dist.begin(), ngh_dist.end(), ngh.data(), [](id_dist pair_data)
-                           { return pair_data.first; });
+            std::transform(ngh_dist.begin(), ngh_dist.end(), ngh.data(), [](IdDist<indexType> pair_data)
+                           { return pair_data.index; });
             all_neighbors[i] = ngh;
         }
 
@@ -166,28 +157,25 @@ namespace ant
                    std::function<std::pair<indexType *, uint>(indexType)> get_sp,
                    const QueryParams &QP, bool contain_centroid = true)
     {
-        using id_dist = std::pair<indexType, float>;
-
-        auto less = [&](id_dist a, id_dist b)
-        {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
-        };
-
         auto deg = 16 * 1024 / Q_Base_Points.params.num_bytes();
         auto num_workers = omp_get_max_threads();
         std::vector<indexType> cur_neighbors(deg * num_workers);
 
-
-        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType, float> &bsCell, std::vector<id_dist> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
+        auto less = [&](IdDist<indexType> a, IdDist<indexType> b)
         {
-            float dist_threshold = (ngh_dist.size() < num_check || num_check < QP.k) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].second;
+            return a.dist < b.dist || (a.dist == b.dist && a.index < b.index);
+        };
+
+        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType> &bsCell, std::vector<IdDist<indexType>> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
+        {
+            float dist_threshold = (ngh_dist.size() < num_check || num_check < QP.k) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].dist;
             num_check = std::max(num_check, (size_t)QP.k);
             // size_t max_cache_size = std::min(Q_Base_Points.getMaxCache(), QQ_Base_Points.getMaxCache());
-            
+
             // std::vector<indexType> cur_neighbors;
             // cur_neighbors.reserve(deg);
             auto worker_id = omp_get_thread_num();
-            auto* cur_neighbors_ptr = cur_neighbors.data() + worker_id * deg;
+            auto *cur_neighbors_ptr = cur_neighbors.data() + worker_id * deg;
             uint32_t cur_neighbors_size = 0;
 
             auto refresh_neighbors = [&](bool forse)
@@ -207,23 +195,24 @@ namespace ant
                         // tmp[index % 16]++;
                         if (dist < dist_threshold)
                         {
-                            ngh_dist.push_back(id_dist(index, dist));
+                            ngh_dist.push_back(IdDist<indexType>(index, dist));
                         }
                     }
                     assert(i < Q_Query_Points.size());
                     QueryStats.increment_dist(i, cur_neighbors_size);
-                    if(ngh_dist.size() > 0){
+                    if (ngh_dist.size() > 0)
+                    {
                         std::sort(ngh_dist.begin(), ngh_dist.end(), less);
-                        ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](id_dist a, id_dist b)
-                                                { return a.first == b.first; }),
-                                    ngh_dist.end());                       
+                        ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](IdDist<indexType> a, IdDist<indexType> b)
+                                                   { return a.index == b.index; }),
+                                       ngh_dist.end());
                     }
 
                     if (ngh_dist.size() > num_check)
                     {
                         assert(num_check > 0);
                         ngh_dist.resize(num_check);
-                        dist_threshold = ngh_dist[num_check - 1].second;
+                        dist_threshold = ngh_dist[num_check - 1].dist;
                     }
 
                     cur_neighbors_size = 0;
@@ -248,10 +237,9 @@ namespace ant
             }
 
             refresh_neighbors(true);
-
         };
         bool use_rerank = Base_Points.params.num_bytes() != Q_Base_Points.params.num_bytes();
-        return ivf_qsearchAll_<indexType, float, QyPR, QyQPR, PR, QCR>(
+        return ivf_qsearchAll_<indexType, QyPR, QyQPR, PR, QCR>(
             Query_Points, Q_Query_Points, G,
             Base_Points, Q_Centroids, c2v_ids, QueryStats,
             fill_ngh_dist, get_sp, QP, use_rerank, contain_centroid);
@@ -271,16 +259,14 @@ namespace ant
                    std::function<std::pair<indexType *, uint>(indexType)> get_sp,
                    const QueryParams &QP)
     {
-        using id_dist = std::pair<indexType, float>;
-
-        auto less = [&](id_dist a, id_dist b)
+        auto less = [&](IdDist<indexType> a, IdDist<indexType> b)
         {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
+            return a.dist < b.dist || (a.dist == b.dist && a.index < b.index);
         };
 
-        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType, float> &bsCell, std::vector<id_dist> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
+        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType> &bsCell, std::vector<IdDist<indexType>> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
         {
-            float dist_threshold = (ngh_dist.size() < num_check) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].second;
+            float dist_threshold = (ngh_dist.size() < num_check) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].dist;
 
             // size_t max_cache_size = std::min(Q_Base_Points.getMaxCache(), QQ_Base_Points.getMaxCache());
             auto deg = 16 * 1024 / Q_Base_Points.params.num_bytes();
@@ -301,17 +287,17 @@ namespace ant
                         float dist = Q_Base_Points[index].distance(Q_Query_Points[i]);
                         if (dist < dist_threshold)
                         {
-                            ngh_dist.push_back(id_dist(index, dist));
+                            ngh_dist.push_back(IdDist<indexType>(index, dist));
                         }
                     }
                     std::sort(ngh_dist.begin(), ngh_dist.end(), less);
-                    ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](id_dist a, id_dist b)
-                                               { return a.first == b.first; }),
+                    ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](IdDist<indexType> a, IdDist<indexType> b)
+                                               { return a.index == b.index; }),
                                    ngh_dist.end());
                     if (ngh_dist.size() > num_check)
                     {
                         ngh_dist.resize(num_check);
-                        dist_threshold = ngh_dist[num_check - 1].second;
+                        dist_threshold = ngh_dist[num_check - 1].dist;
                     }
 
                     cur_neighbors.resize(0);
@@ -335,7 +321,7 @@ namespace ant
             refresh_neighbors(true);
         };
         bool use_rerank = Base_Points.params.num_bytes() != Q_Base_Points.params.num_bytes();
-        return ivf_qsearchAll_<indexType, float, QyPR, QyQPR, PR, QCR>(
+        return ivf_qsearchAll_<indexType, QyPR, QyQPR, PR, QCR>(
             Query_Points, Q_Query_Points, G,
             Base_Points, Q_Centroids, c2v_ids, QueryStats,
             fill_ngh_dist, get_sp, QP, use_rerank);
@@ -354,19 +340,18 @@ namespace ant
                    std::function<std::pair<indexType *, uint>(indexType)> get_sp,
                    const QueryParams &QP)
     {
-        using id_dist = std::pair<indexType, float>;
         using dataType = typename QCR::T;
-        auto less = [&](id_dist a, id_dist b)
+        auto less = [&](IdDist<indexType> a, IdDist<indexType> b)
         {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
+            return a.dist < b.dist || (a.dist == b.dist && a.index < b.index);
         };
         auto params = Q_Centroids.params;
         using Point = typename QCR::Point;
         using byte = typename QCR::Point::byte;
 
-        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType, float> &bsCell, std::vector<id_dist> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
+        auto fill_ngh_dist = [&](BeamSearchMemoryCell<indexType> &bsCell, std::vector<IdDist<indexType>> &ngh_dist, std::vector<indexType> &ngh, size_t num_check, size_t i)
         {
-            float dist_threshold = (ngh_dist.size() < num_check) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].second;
+            float dist_threshold = (ngh_dist.size() < num_check) ? std::numeric_limits<float>::max() : ngh_dist[num_check - 1].dist;
 
             auto deg = 16 * 1024 / Q_Centroids.params.num_bytes();
             std::vector<std::pair<indexType, dataType *>> cur_neighbors;
@@ -388,17 +373,17 @@ namespace ant
                         float dist = p.distance(Q_Query_Points[i]);
                         if (dist < dist_threshold)
                         {
-                            ngh_dist.push_back(id_dist(nb.first, dist));
+                            ngh_dist.push_back(IdDist<indexType>(nb.first, dist));
                         }
                     }
                     std::sort(ngh_dist.begin(), ngh_dist.end(), less);
-                    ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](id_dist a, id_dist b)
-                                               { return a.first == b.first; }),
+                    ngh_dist.erase(std::unique(ngh_dist.begin(), ngh_dist.end(), [](IdDist<indexType> a, IdDist<indexType> b)
+                                               { return a.index == b.index; }),
                                    ngh_dist.end());
                     if (ngh_dist.size() > num_check)
                     {
                         ngh_dist.resize(num_check);
-                        dist_threshold = ngh_dist[num_check - 1].second;
+                        dist_threshold = ngh_dist[num_check - 1].dist;
                     }
 
                     cur_neighbors.resize(0);
@@ -428,7 +413,7 @@ namespace ant
             refresh_neighbors(true);
         };
         bool use_rerank = Base_Points.params.num_bytes() != Q_Centroids.params.num_bytes();
-        return ivf_qsearchAll_<indexType, float, QyPR, QyQPR, PR, QCR>(
+        return ivf_qsearchAll_<indexType, QyPR, QyQPR, PR, QCR>(
             Query_Points, Q_Query_Points, G,
             Base_Points, Q_Centroids, c2v_ids, QueryStats,
             fill_ngh_dist, get_sp, QP, use_rerank);

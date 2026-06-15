@@ -1,7 +1,7 @@
 #pragma once
 #include <random>
 #include "disk_ivf.h"
-#include "ivf.h"
+#include "utils/ivf/ivf.h"
 
 namespace ant
 {

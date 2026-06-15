@@ -21,7 +21,7 @@ struct Args
     bool use_mips = false;
 
     // std::string data_type = "uint8";
-    // std::string dist_func = "euclidian";
+    // std::string dist_func = "euclidean";
     // std::string index_type = "uint32";
     int k = 100;
 };
@@ -48,7 +48,7 @@ void compute_groundtruth(Args args)
 
     uint32_t BLOCK_SIZE = 100000;
     using Parameters = typename PR::Parameters;
-    PR base_points = PR(BLOCK_SIZE, Parameters(query_points.dimension(), args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDIAN));
+    PR base_points = PR(BLOCK_SIZE, Parameters(query_points.dimension(), args.use_mips ? DistanceMetric::MIPS : DistanceMetric::EUCLIDEAN));
     std::ifstream reader(args.base_path, std::ios::in | std::ios::binary);
     assert(reader.is_open());
     reader.read((char *)&n, sizeof(indexType));

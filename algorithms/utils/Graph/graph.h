@@ -1,6 +1,8 @@
 #pragma once
 #include <omp.h>
 #include <algorithm>
+#include <vector>
+#include <fstream>
 #include <fcntl.h>
 #include <iostream>
 #include <sys/mman.h>
@@ -9,126 +11,124 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cassert>
+#include <cstring>
 
 namespace ant
 {
-
-  template <typename indexType>
-  struct edgeRange
+  // 单个节点的邻接表视图；edges[0] 存当前度数，edges[1..] 存邻居 id
+  template <typename IndexType>
+  struct EdgeRange
   {
-
     size_t size() const { return edges[0]; }
 
-    indexType id() const { return id_; }
+    IndexType id() const { return node_id_; }
 
-    edgeRange() : edges(nullptr) {}
+    EdgeRange() : edges(nullptr) {}
 
-    edgeRange(indexType *start, indexType *end, indexType id)
-        : edges(start), id_(id)
+    EdgeRange(IndexType *start, IndexType *end, IndexType node_id)
+        : edges(start), node_id_(node_id)
     {
-      maxDeg = (end - start) - 1;
+      max_degree_ = static_cast<unsigned>((end - start) - 1);
     }
 
-    indexType operator[](size_t j) const
+    IndexType operator[](size_t neighbor_idx) const
     {
-      if (j > edges[0])
+      if (neighbor_idx >= edges[0])
       {
-        std::cout << "g[] ERROR: index exceeds degree while accessing neighbors " << j << ">" << edges[0] << std::endl;
+        std::cout << "g[] ERROR: index exceeds degree while accessing neighbors "
+                  << neighbor_idx << ">=" << edges[0] << std::endl;
         abort();
       }
-      else
-        return edges[j + 1];
+      return edges[neighbor_idx + 1];
     }
 
-    void append_neighbor(indexType nbh)
+    void append_neighbor(IndexType neighbor_id)
     {
-      if (edges[0] == maxDeg)
+      if (edges[0] == max_degree_)
       {
         std::cout << "ERROR in append_neighbor: cannot exceed max degree "
-                  << maxDeg << std::endl;
+                  << max_degree_ << std::endl;
         abort();
       }
-      else
-      {
-        edges[edges[0] + 1] = nbh;
-        edges[0] += 1;
-      }
+      edges[edges[0] + 1] = neighbor_id;
+      edges[0] += 1;
     }
 
-    template <typename rangeType>
-    void update_neighbors(const rangeType &r)
+    template <typename RangeType>
+    void update_neighbors(const RangeType &neighbors)
     {
-      if (r.size() > maxDeg)
+      if (neighbors.size() > max_degree_)
       {
         std::cout << "ERROR in update_neighbors: cannot exceed max degree "
-                  << maxDeg << std::endl;
+                  << max_degree_ << std::endl;
         abort();
       }
-      edges[0] = r.size();
-      for (int i = 0; i < r.size(); i++)
+      edges[0] = neighbors.size();
+      for (size_t i = 0; i < neighbors.size(); ++i)
       {
-        edges[i + 1] = r[i];
+        edges[i + 1] = neighbors[i];
       }
     }
 
-    template <typename id_dist>
-    void update_neighbors(const id_dist *nbhs, indexType num_nbh)
+    template <typename IdDist>
+    void update_neighbors(const IdDist *neighbors, IndexType num_neighbors)
     {
-      if (num_nbh > maxDeg)
+      if (num_neighbors > max_degree_)
       {
         std::cout << "ERROR in update_neighbors: cannot exceed max degree "
-                  << maxDeg << std::endl;
+                  << max_degree_ << std::endl;
         abort();
       }
-      edges[0] = num_nbh;
-      for (int i = 0; i < num_nbh; i++)
+      edges[0] = num_neighbors;
+      for (IndexType i = 0; i < num_neighbors; ++i)
       {
-        edges[i + 1] = nbhs[i].index;
+        edges[i + 1] = neighbors[i].index;
       }
     }
 
-    void clear_neighbors()
-    {
-      edges[0] = 0;
-    }
+    void clear_neighbors() { edges[0] = 0; }
 
     void prefetch() const
     {
-      int l = ((edges[0] + 1) * sizeof(indexType)) / 64;
-      for (int i = 0; i < l; i++)
-        __builtin_prefetch((char *)edges + i * 64);
+      int cache_lines = static_cast<int>(((edges[0] + 1) * sizeof(IndexType)) / 64);
+      for (int i = 0; i < cache_lines; ++i)
+      {
+        __builtin_prefetch(reinterpret_cast<char *>(edges) + i * 64);
+      }
     }
 
-    template <typename F>
-    void sort(F &&less)
+    template <typename Compare>
+    void sort(Compare &&compare)
     {
-      std::sort(this->begin(), this->end(), less);
+      std::sort(begin(), end(), compare);
     }
 
-    indexType *begin() const { return edges + 1; }
+    IndexType *begin() const { return edges + 1; }
 
-    indexType *end() const { return edges + 1 + edges[0]; }
+    IndexType *end() const { return edges + 1 + edges[0]; }
 
-    indexType *data() const { return edges; }
+    IndexType *data() const { return edges; }
 
   private:
-    indexType *edges;
-    unsigned maxDeg;
-    indexType id_;
+    IndexType *edges;
+    unsigned max_degree_;
+    IndexType node_id_;
   };
 
-  template <typename indexType_>
+  // 图结构：每个节点占用 (max_degree + 1) 个 IndexType
+  template <typename IndexType_>
   struct Graph
   {
-    using indexType = indexType_;
+    using IndexType = IndexType_;
 
-    unsigned max_degree() const { return maxDeg; }
-    size_t size() const { return n; }
+    unsigned max_degree() const { return max_degree_; }
+    size_t size() const { return num_nodes_; }
+
     void resize(size_t new_size)
     {
-      if (new_size <= capacity_size)
+      if (new_size <= capacity_size_)
       {
-        n = new_size;
+        num_nodes_ = new_size;
       }
       else
       {
@@ -139,140 +139,140 @@ namespace ant
 
     Graph() {}
 
-    void allocate_graph(unsigned maxDeg, size_t n, bool use_madvise)
+    void allocate_graph(unsigned max_degree, size_t num_nodes, bool use_madvise)
     {
-      capacity_size = n;
-      size_t cnt = n * (maxDeg + 1);
-      size_t num_bytes = cnt * sizeof(indexType);
-      indexType *ptr;
+      capacity_size_ = num_nodes;
+      max_degree_ = max_degree;
+      size_t entry_count = num_nodes * (max_degree_ + 1);
+      size_t num_bytes = entry_count * sizeof(IndexType);
+      IndexType *ptr;
       if (use_madvise)
       {
-        ptr = (indexType *)aligned_alloc(1l << 21, num_bytes);
+        ptr = static_cast<IndexType *>(aligned_alloc(1l << 21, num_bytes));
         madvise(ptr, num_bytes, MADV_HUGEPAGE);
       }
       else
       {
-        ptr = (indexType *)malloc(num_bytes);
+        ptr = static_cast<IndexType *>(malloc(num_bytes));
       }
       memset(ptr, 0, num_bytes);
 
-      graph = std::shared_ptr<indexType[]>(ptr, std::free);
+      graph_ = std::shared_ptr<IndexType[]>(ptr, std::free);
     }
 
-    Graph(unsigned maxDeg, size_t n, bool use_madvise = true) : maxDeg(maxDeg), n(n)
+    Graph(unsigned max_degree, size_t num_nodes, bool use_madvise = true) : max_degree_(max_degree), num_nodes_(num_nodes)
     {
-      allocate_graph(maxDeg, n, use_madvise);
+      allocate_graph(max_degree, num_nodes, use_madvise);
     }
 
-    Graph(const char *gFile, bool use_madvise = true)
+    // 从二进制文件构造图；格式：[num_nodes][max_degree][degrees...][neighbors...]
+    Graph(const char *graph_file, bool use_madvise = true)
     {
-      std::ifstream reader(gFile);
+      std::ifstream reader(graph_file);
       if (!reader.is_open())
       {
-        std::cout << "graph file " << gFile << " not found" << std::endl;
+        std::cout << "graph file " << graph_file << " not found" << std::endl;
         abort();
       }
 
-      // read num points and max degree
-      indexType num_points;
-      indexType max_deg;
-      reader.read((char *)(&num_points), sizeof(indexType));
-      n = num_points;
-      reader.read((char *)(&max_deg), sizeof(indexType));
-      maxDeg = max_deg;
-      std::cout << "Graph: detected " << num_points
-                << " points with max degree " << max_deg << std::endl;
+      IndexType num_nodes;
+      IndexType max_degree;
+      reader.read(reinterpret_cast<char *>(&num_nodes), sizeof(IndexType));
+      num_nodes_ = num_nodes;
+      reader.read(reinterpret_cast<char *>(&max_degree), sizeof(IndexType));
+      max_degree_ = max_degree;
+      std::cout << "Graph: detected " << num_nodes
+                << " points with max degree " << max_degree << std::endl;
 
-      allocate_graph(max_deg, n, use_madvise);
+      allocate_graph(max_degree_, num_nodes_, use_madvise);
 
-      // 先读出每个节点邻居的数量
-      std::vector<indexType> sizes = std::vector<indexType>(n);
-      reader.read((char *)sizes.data(), sizeof(indexType) * n);
+      std::vector<IndexType> degrees(num_nodes_);
+      reader.read(reinterpret_cast<char *>(degrees.data()), sizeof(IndexType) * num_nodes_);
 
-      size_t BLOCK_SIZE = 1000000;
-      std::vector<indexType> data = std::vector<indexType>(BLOCK_SIZE);
-      size_t cur_size = 0;
-      size_t cur_index = 0;
-      indexType *gr = graph.get();
-      for (size_t i = 0; i < n + 1; ++i)
+      constexpr size_t BLOCK_SIZE = 1000000;
+      std::vector<IndexType> neighbor_buffer(BLOCK_SIZE);
+      size_t batch_neighbor_count = 0;
+      size_t batch_start_node = 0;
+      IndexType *graph_data = graph_.get();
+      for (size_t i = 0; i < num_nodes_ + 1; ++i)
       {
-        if (i == n || cur_size + sizes[i] > BLOCK_SIZE)
+        if (i == num_nodes_ || batch_neighbor_count + degrees[i] > BLOCK_SIZE)
         {
-          // 读出数据
-          reader.read((char *)data.data(), cur_size * sizeof(indexType));
-          size_t cur_offset = 0;
-          for (size_t j = cur_index; j < i; ++j)
+          reader.read(reinterpret_cast<char *>(neighbor_buffer.data()), batch_neighbor_count * sizeof(IndexType));
+          size_t offset = 0;
+          for (size_t j = batch_start_node; j < i; ++j)
           {
-            gr[j * (maxDeg + 1)] = sizes[j];
-            memcpy((*this)[j].begin(), data.data() + cur_offset, sizes[j] * sizeof(indexType));
-            cur_offset += sizes[j];
+            graph_data[j * (max_degree_ + 1)] = degrees[j];
+            memcpy((*this)[j].begin(), neighbor_buffer.data() + offset, degrees[j] * sizeof(IndexType));
+            offset += degrees[j];
           }
-          assert(cur_offset == cur_size);
-          cur_index = i;
-          cur_size = 0;
-          if (i == n)
+          assert(offset == batch_neighbor_count);
+          batch_start_node = i;
+          batch_neighbor_count = 0;
+          if (i == num_nodes_)
+          {
             break;
+          }
         }
-        cur_size += sizes[i];
+        batch_neighbor_count += degrees[i];
       }
 
       reader.close();
     }
 
-    void load(const char *gFile)
+    // 将图数据加载到已分配的同尺寸图中
+    void load(const char *graph_file)
     {
-      std::ifstream reader(gFile);
+      std::ifstream reader(graph_file);
       if (!reader.is_open())
       {
-        std::cout << "graph file " << gFile << " not found" << std::endl;
+        std::cout << "graph file " << graph_file << " not found" << std::endl;
         abort();
       }
 
-      // read num points and max degree
-      indexType num_points;
-      indexType max_deg;
-      reader.read((char *)(&num_points), sizeof(indexType));
-
-      reader.read((char *)(&max_deg), sizeof(indexType));
-      if (num_points != n || maxDeg != max_deg)
+      IndexType num_nodes;
+      IndexType max_degree;
+      reader.read(reinterpret_cast<char *>(&num_nodes), sizeof(IndexType));
+      reader.read(reinterpret_cast<char *>(&max_degree), sizeof(IndexType));
+      if (num_nodes != num_nodes_ || max_degree_ != max_degree)
       {
         std::cout << "graph size error!!!" << std::endl;
         abort();
       }
-      n = num_points;
-      maxDeg = max_deg;
-      std::cout << "Graph: detected " << num_points
-                << " points with max degree " << max_deg << std::endl;
+      num_nodes_ = num_nodes;
+      max_degree_ = max_degree;
+      std::cout << "Graph: detected " << num_nodes
+                << " points with max degree " << max_degree << std::endl;
 
-      // 先读出每个节点邻居的数量
-      std::vector<indexType> sizes = std::vector<indexType>(n);
-      reader.read((char *)sizes.data(), sizeof(indexType) * n);
+      std::vector<IndexType> degrees(num_nodes_);
+      reader.read(reinterpret_cast<char *>(degrees.data()), sizeof(IndexType) * num_nodes_);
 
-      size_t BLOCK_SIZE = 1000000;
-      std::vector<indexType> data = std::vector<indexType>(BLOCK_SIZE);
-      size_t cur_size = 0;
-      size_t cur_index = 0;
-      indexType *gr = graph.get();
-      for (size_t i = 0; i < n + 1; ++i)
+      constexpr size_t BLOCK_SIZE = 1000000;
+      std::vector<IndexType> neighbor_buffer(BLOCK_SIZE);
+      size_t batch_neighbor_count = 0;
+      size_t batch_start_node = 0;
+      IndexType *graph_data = graph_.get();
+      for (size_t i = 0; i < num_nodes_ + 1; ++i)
       {
-        if (i == n || cur_size + sizes[i] > BLOCK_SIZE)
+        if (i == num_nodes_ || batch_neighbor_count + degrees[i] > BLOCK_SIZE)
         {
-          // 读出数据
-          reader.read((char *)data.data(), cur_size * sizeof(indexType));
-          size_t cur_offset = 0;
-          for (size_t j = cur_index; j < i; ++j)
+          reader.read(reinterpret_cast<char *>(neighbor_buffer.data()), batch_neighbor_count * sizeof(IndexType));
+          size_t offset = 0;
+          for (size_t j = batch_start_node; j < i; ++j)
           {
-            gr[j * (maxDeg + 1)] = sizes[j];
-            memcpy((*this)[j].begin(), data.data() + cur_offset, sizes[j] * sizeof(indexType));
-            cur_offset += sizes[j];
+            graph_data[j * (max_degree_ + 1)] = degrees[j];
+            memcpy((*this)[j].begin(), neighbor_buffer.data() + offset, degrees[j] * sizeof(IndexType));
+            offset += degrees[j];
           }
-          assert(cur_offset == cur_size);
-          cur_index = i;
-          cur_size = 0;
-          if (i == n)
+          assert(offset == batch_neighbor_count);
+          batch_start_node = i;
+          batch_neighbor_count = 0;
+          if (i == num_nodes_)
+          {
             break;
+          }
         }
-        cur_size += sizes[i];
+        batch_neighbor_count += degrees[i];
       }
 
       reader.close();
@@ -281,51 +281,45 @@ namespace ant
     void clear()
     {
 #pragma omp parallel for
-      for (size_t i = 0; i < n; ++i)
+      for (size_t i = 0; i < num_nodes_; ++i)
       {
         (*this)[i].clear_neighbors();
       }
     }
 
-    void random_init(unsigned neighbors, size_t start_id, size_t len)
+    // 在 [start_id, start_id + len) 范围内随机初始化邻居
+    void random_init(unsigned neighbors_per_node, size_t start_id, size_t len)
     {
-      assert(neighbors < maxDeg);
-      // 随机初始化每个节点的邻居，如果随机初始化后，有某个邻居是当前节点，就把这个邻居删除
+      assert(neighbors_per_node < max_degree_);
 
-      // 使用 OpenMP 并行处理每个节点
-      #pragma omp parallel
+#pragma omp parallel
       {
-        // 每个线程使用自己的随机数生成器，避免竞争
         unsigned int seed = omp_get_thread_num();
 
-        #pragma omp for
+#pragma omp for
         for (size_t i = start_id; i < start_id + len; ++i)
         {
           auto node = (*this)[i];
           node.clear_neighbors();
 
-          // 尝试添加 neighbors 个邻居
           unsigned added = 0;
           unsigned attempts = 0;
-          const unsigned max_attempts = neighbors * 10; // 防止无限循环
+          const unsigned max_attempts = neighbors_per_node * 10;
 
-          while (added < neighbors && attempts < max_attempts)
+          while (added < neighbors_per_node && attempts < max_attempts)
           {
-            // 生成随机邻居 ID [0, n)
-            indexType nbh = rand_r(&seed) % len + start_id;
-            attempts++;
+            IndexType neighbor_id = rand_r(&seed) % len + start_id;
+            ++attempts;
 
-            // 跳过自身
-            if (nbh == i)
+            if (neighbor_id == i)
             {
               continue;
             }
 
-            // 检查是否已存在（避免重复邻居）
             bool exists = false;
             for (size_t j = 0; j < node.size(); ++j)
             {
-              if (node[j] == nbh)
+              if (node[j] == neighbor_id)
               {
                 exists = true;
                 break;
@@ -334,75 +328,75 @@ namespace ant
 
             if (!exists)
             {
-              node.append_neighbor(nbh);
-              added++;
+              node.append_neighbor(neighbor_id);
+              ++added;
             }
           }
         }
       }
     }
 
-    void save(const char *oFile)
+    void save(const char *output_file)
     {
-      std::cout << "Writing graph with " << n
-                << " points and max degree " << maxDeg
+      std::cout << "Writing graph with " << num_nodes_
+                << " points and max degree " << max_degree_
                 << std::endl;
       std::ofstream writer;
-      writer.open(oFile, std::ios::binary | std::ios::out);
-      indexType num_points = n;
-      indexType max_deg = maxDeg;
-      writer.write((char *)&num_points, sizeof(indexType));
-      writer.write((char *)&max_deg, sizeof(indexType));
+      writer.open(output_file, std::ios::binary | std::ios::out);
+      IndexType num_nodes = num_nodes_;
+      IndexType max_degree = max_degree_;
+      writer.write(reinterpret_cast<char *>(&num_nodes), sizeof(IndexType));
+      writer.write(reinterpret_cast<char *>(&max_degree), sizeof(IndexType));
 
-      // 先存每个节点的邻居数量
-      std::vector<indexType> sizes = std::vector<indexType>(n);
+      std::vector<IndexType> degrees(num_nodes_);
 #pragma omp parallel for
-      for (size_t i = 0; i < n; ++i)
+      for (size_t i = 0; i < num_nodes_; ++i)
       {
-        sizes[i] = (*this)[i].size();
+        degrees[i] = (*this)[i].size();
       }
-      writer.write((char *)sizes.data(), sizes.size() * sizeof(indexType));
+      writer.write(reinterpret_cast<char *>(degrees.data()), degrees.size() * sizeof(IndexType));
 
-      size_t BLOCK_SIZE = 1000000;
-      std::vector<indexType> data = std::vector<indexType>(BLOCK_SIZE);
-      size_t cur_size = 0;
-      for (size_t i = 0; i < n + 1; ++i)
+      constexpr size_t BLOCK_SIZE = 1000000;
+      std::vector<IndexType> neighbor_buffer(BLOCK_SIZE);
+      size_t batch_neighbor_count = 0;
+      for (size_t i = 0; i < num_nodes_ + 1; ++i)
       {
-        if (i == n || cur_size + sizes[i] > BLOCK_SIZE)
+        if (i == num_nodes_ || batch_neighbor_count + degrees[i] > BLOCK_SIZE)
         {
-          // 写入之前的数据
-          writer.write((char *)data.data(), cur_size * sizeof(indexType));
-          cur_size = 0;
-          if (i == n)
+          writer.write(reinterpret_cast<char *>(neighbor_buffer.data()), batch_neighbor_count * sizeof(IndexType));
+          batch_neighbor_count = 0;
+          if (i == num_nodes_)
+          {
             break;
+          }
         }
 
-        memcpy(data.data() + cur_size, (*this)[i].begin(), sizes[i] * sizeof(indexType));
-        cur_size += sizes[i];
+        memcpy(neighbor_buffer.data() + batch_neighbor_count, (*this)[i].begin(), degrees[i] * sizeof(IndexType));
+        batch_neighbor_count += degrees[i];
       }
 
       writer.close();
     }
 
-    edgeRange<indexType> operator[](size_t i) const
+    EdgeRange<IndexType> operator[](size_t node_id) const
     {
-      if (i > n)
+      if (node_id >= num_nodes_)
       {
-        std::cout << "ERROR: graph index out of range: " << i << std::endl;
+        std::cout << "ERROR: graph index out of range: " << node_id << std::endl;
         abort();
       }
-      return edgeRange<indexType>(graph.get() + i * (maxDeg + 1),
-                                  graph.get() + (i + 1) * (maxDeg + 1),
-                                  i);
+      return EdgeRange<IndexType>(graph_.get() + node_id * (max_degree_ + 1),
+                                  graph_.get() + (node_id + 1) * (max_degree_ + 1),
+                                  node_id);
     }
 
     ~Graph() {}
 
   private:
-    size_t n;
-    size_t capacity_size;
-    unsigned maxDeg;
-    std::shared_ptr<indexType[]> graph;
+    size_t num_nodes_;
+    size_t capacity_size_;
+    unsigned max_degree_;
+    std::shared_ptr<IndexType[]> graph_;
   };
 
-} // end namespace
+}

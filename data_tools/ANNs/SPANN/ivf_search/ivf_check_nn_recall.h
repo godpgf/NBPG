@@ -1,5 +1,5 @@
 #pragma once
-#include "utils/stats/check_nn_recall.h"
+#include "base/check_nn_recall.h"
 #include "ivf_beamSearch.h"
 
 namespace ant
@@ -31,7 +31,7 @@ namespace ant
         float query_time;
         QueryStatic QueryStats(Query_Points.size());
         QueryStats.clear();
-        Base_Points.init();
+        Base_Points.init_cache();
 
         Timer t;
         std::vector<std::vector<indexType>> all_ngh = ivf_qsearchAll<indexType, QyPR, QyQPR, PR, QPR, QCR>(Query_Points,
@@ -50,7 +50,7 @@ namespace ant
         query_time = t.get_next();
 
         auto res = calRecall(all_ngh, Base_Points, Query_Points, GT, k, QP, verbose, QueryStats, query_time);
-        Base_Points.clear();
+        Base_Points.clear_cache();
         return res;
     }
 

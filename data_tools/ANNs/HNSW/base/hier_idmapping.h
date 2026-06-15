@@ -43,7 +43,7 @@ namespace ant
             writer.close();
         }
 
-        uint get_level(int64_t node_id)
+        uint get_level(int64_t node_id) const
         {
             uint l = 0;
             assert(node_id >= 0);
@@ -74,12 +74,12 @@ namespace ant
             this->sp = start_point;
         }
 
-        size_t get_sp()
+        size_t get_sp() const
         {
             return sp;
         }
 
-        size_t get_root_id(int64_t node_id)
+        size_t get_root_id(int64_t node_id) const
         {
             int64_t pre_id = node_id;
             while (pre_id >= 0)

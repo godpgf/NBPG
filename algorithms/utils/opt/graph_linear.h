@@ -78,21 +78,21 @@ namespace ant
                     for (auto head_id = 0; head_id < head_num; ++head_id)
                     {
                         // （1）利用输出变量y来暂存当前节点的输入
-                        auto input_vec = y[i].getSubPoint(head_id, sub_dim);
+                        auto input_vec = y[i].get_sub_point(head_id, sub_dim);
                         if (step == 0)
                         {
-                            input_vec.copy_(x[i].getSubPoint(head_id, sub_dim));
+                            input_vec.copy_(x[i].get_sub_point(head_id, sub_dim));
                         }
                         else
                         {
                             auto pre_h = get_step_layer(hidden, i, step - 1);
-                            input_vec.copy_(pre_h.getSubPoint(head_id, sub_dim));
+                            input_vec.copy_(pre_h.get_sub_point(head_id, sub_dim));
                         }
 
                         // （2）对于pre-norm，需要计算归一化后的数据
                         if (pre_norm)
                         {
-                            auto after_norm = get_step_layer(norm_hidden, i, step).getSubPoint(head_id, sub_dim);
+                            auto after_norm = get_step_layer(norm_hidden, i, step).get_sub_point(head_id, sub_dim);
                             RMSNorm<T>::forward(input_vec, after_norm);
                             input_vec.copy_(after_norm);
                         }
@@ -104,8 +104,8 @@ namespace ant
                         }
                         else
                         {
-                            auto pre_action = get_step_layer(action, i, step - 1).getSubPoint(head_id, L);
-                            auto pre_nodeIds = get_step_layer(nodeIds, i, step - 1).getSubPoint(head_id, L);
+                            auto pre_action = get_step_layer(action, i, step - 1).get_sub_point(head_id, L);
+                            auto pre_nodeIds = get_step_layer(nodeIds, i, step - 1).get_sub_point(head_id, L);
                             for (auto j = 0; j < L; ++j)
                             {
                                 auto index = pre_nodeIds[j];
@@ -257,8 +257,8 @@ namespace ant
 
                     for (auto head_id = 0; head_id < head_num; ++head_id)
                     {
-                        auto before_norm = get_step_layer(norm_action, i, step).getSubPoint(head_id, L);
-                        auto sub_action_grad = cur_action_grad.getSubPoint(head_id, L);
+                        auto before_norm = get_step_layer(norm_action, i, step).get_sub_point(head_id, L);
+                        auto sub_action_grad = cur_action_grad.get_sub_point(head_id, L);
                         RMSNorm<T>::backward(before_norm, sub_action_grad, sub_action_grad);
                     }
 
@@ -267,9 +267,9 @@ namespace ant
                     // （5）计算在注意力之前的梯度
                     for (auto head_id = 0; head_id < head_num; ++head_id)
                     {
-                        auto after_norm = get_step_layer(norm_hidden, i, step).getSubPoint(head_id, sub_dim);
-                        const auto cur_pre_h = pre_h.getSubPoint(head_id, sub_dim);
-                        auto cur_h_grad = h_grad.getSubPoint(head_id, sub_dim);
+                        auto after_norm = get_step_layer(norm_hidden, i, step).get_sub_point(head_id, sub_dim);
+                        const auto cur_pre_h = pre_h.get_sub_point(head_id, sub_dim);
+                        auto cur_h_grad = h_grad.get_sub_point(head_id, sub_dim);
                         for (auto j = head_id * L; j < (head_id + 1) * L; ++j)
                         {
                             auto act_grad = cur_action_grad.data()[j];
@@ -342,8 +342,8 @@ namespace ant
 
         void fill_action(uint32_t batch_id, uint32_t head_id, uint32_t step, std::vector<id_act> &candidates)
         {
-            auto cur_action = get_step_layer(action, batch_id, step).getSubPoint(head_id, L);
-            auto cur_nodeIds = get_step_layer(nodeIds, batch_id, step).getSubPoint(head_id, L);
+            auto cur_action = get_step_layer(action, batch_id, step).get_sub_point(head_id, L);
+            auto cur_nodeIds = get_step_layer(nodeIds, batch_id, step).get_sub_point(head_id, L);
             for (auto j = 0; j < candidates.size(); ++j)
             {
                 auto edg = candidates[j];
@@ -353,7 +353,7 @@ namespace ant
             candidates.resize(0);
 
             {
-                auto before_norm = get_step_layer(norm_action, batch_id, step).getSubPoint(head_id, L);
+                auto before_norm = get_step_layer(norm_action, batch_id, step).get_sub_point(head_id, L);
                 before_norm.copy_(cur_action);
                 RMSNorm<T>::forward(before_norm, cur_action);
             }

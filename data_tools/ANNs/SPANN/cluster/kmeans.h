@@ -3,17 +3,47 @@
 #include <omp.h>
 #include <iostream>
 #include <cassert>
-#include "utils/pq/pivot.h"
+#include "pivot.h"
+#include "utils/Point/point.h"
 
 namespace ant
 {
+    int get_chunk_size(uint8_t p){return 1;}
+    int get_chunk_size(int8_t p){return 1;}
+    int get_chunk_size(float p){return 1;}
+    int get_chunk_size(uint4_2 p){return 2;}
+    int get_chunk_size(int4_2 p){return 2;}
+    void depress(const float* p, unsigned dim, float* out_p){memcpy(out_p, p, dim * sizeof(float));}
+    void depress(const uint8_t* p, unsigned dim, float* out_p){std::transform(p, p+dim, out_p, [](uint8_t a){return (float)a;});}
+    void depress(const int8_t* p, unsigned dim, float* out_p){std::transform(p, p+dim, out_p, [](int8_t a){return (float)a;});}
+    void depress(const uint4_2* p, unsigned dim, float* out_p){
+        const uint8_t MASK = static_cast<uint8_t>(0xF0);
+        for(auto i = 0; i < dim; ++i){
+            auto v = p[i];
+            int a = static_cast<uint8_t>((int)v & MASK);
+            int b = static_cast<uint8_t>((int)v << 4);
+            out_p[i * 2 + 1] = a;
+            out_p[i * 2] = b;
+        }
+    }
+    void depress(const int4_2* p, unsigned dim, float* out_p){
+        const uint8_t MASK = static_cast<uint8_t>(0xF0);
+        for(auto i = 0; i < dim; ++i){
+            auto v = p[i];
+            int a = static_cast<uint8_t>((int)v & MASK);
+            int b = static_cast<uint8_t>((int)v << 4);
+            out_p[i * 2 + 1] = a;
+            out_p[i * 2] = b;
+        }
+    }
 
     template <typename PR, typename indexType>
     void train_kmeans(std::vector<indexType> &centroid_ids, PR &Points, indexType *indices, indexType indices_size, uint pivots_num, uint max_reps = 8, uint init_scale = 10)
     {
         using dataType = typename PR::T;
         using Point = typename PR::Point;
-        indexType dim = Points.dimension() * Point::getChunkSize();
+        dataType p;
+        indexType dim = Points.dimension() * get_chunk_size(p);
         auto num_workers = omp_get_max_threads();
         std::vector<float> depress_cache = std::vector<float>(dim * num_workers);
 
@@ -39,7 +69,7 @@ namespace ant
 
         {
             // 初始化第一个轴
-            Points[rand_indices[0]].depress(pivots.data());
+            depress(Points[rand_indices[0]].data(), Points.dimension(), pivots.data());
 
             // 计算每个向量距离之前轴的最远距离
             std::vector<float> all_dist = std::vector<float>(init_point_num, 0);
@@ -59,7 +89,8 @@ namespace ant
                     auto worker_id = omp_get_thread_num();
                     auto *cur_tmp_dist = tmp_dist.data() + worker_id;
                     auto *cur_depress = depress_cache.data() + worker_id * dim;
-                    Points[rand_indices[jj]].depress(cur_depress);
+
+                    depress(Points[rand_indices[jj]].data(), Points.dimension(), cur_depress);
 
                     Pivot::pq_distance<float>(cur_depress, dim, pre_pivot, order_ids.data(), 1, 1, cur_tmp_dist);
 
@@ -81,7 +112,7 @@ namespace ant
                 // 用最远向量填写当前轴
                 {
                     float *cur_pivot = pivots.data() + i * dim;
-                    Points[rand_indices[max_id]].depress(cur_pivot);
+                    depress(Points[rand_indices[max_id]].data(), Points.dimension(), cur_pivot);
                 }
 
                 // printProgressBar((i + 1) / (double)pivots_num);
@@ -129,7 +160,7 @@ namespace ant
                     double *cur_pivots_sum = pivots_sum.data() + worker_id * pivots_num * dim;
 
                     auto *cur_depress = depress_cache.data() + worker_id * dim;
-                    Points[rand_indices[i]].depress(cur_depress);
+                    depress(Points[rand_indices[i]].data(), Points.dimension(), cur_depress);
 
                     pivot.encode(cur_depress, dim, cur_min_pivot_id, cur_min_dis, cur_tmp_dis);
                     
@@ -192,7 +223,7 @@ namespace ant
                     for (size_t i = sid; i < sid + cur_batch_size; ++i)
                     {
                         auto *cur_depress = depress_cache.data() + omp_get_thread_num() * dim;
-                        Points[rand_indices[i]].depress(cur_depress);
+                        depress(Points[rand_indices[i]].data(), Points.dimension(), cur_depress);
                         Pivot::pq_distance<float>(cur_depress, dim, cur_pivot, order_ids.data(), 1, 1, tmp_dist.data() + i);
                     }
                 }
